@@ -7,8 +7,9 @@ import threading
 import time
 from multiprocessing import Process, Queue
 from typing import Any
-
-import carla
+import socket
+import json
+import carla  # pylint: disable=import-error
 import numpy as np
 import pyopencl as cl
 import pyopencl.array as cl_array
@@ -16,18 +17,23 @@ import pyopencl.array as cl_array
 import cereal.messaging as messaging
 from cereal import log
 from cereal.visionipc import VisionIpcServer, VisionStreamType
-from openpilot.common.basedir import BASEDIR
-from openpilot.common.numpy_fast import clip
-from openpilot.common.params import Params
-from openpilot.common.realtime import DT_DMON, Ratekeeper
-from openpilot.selfdrive.car.honda.values import CruiseButtons
-from openpilot.selfdrive.test.helpers import set_params_enabled
-from openpilot.tools.sim.lib.can import can_function
+from common.basedir import BASEDIR
+from common.numpy_fast import clip
+from common.params import Params
+from common.realtime import DT_DMON, Ratekeeper
+from selfdrive.car.honda.values import CruiseButtons
+from selfdrive.test.helpers import set_params_enabled
+from tools.sim.lib.can import can_function
 
 W, H = 1928, 1208
 REPEAT_COUNTER = 5
 PRINT_DECIMATION = 100
 STEER_RATIO = 15.
+
+s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+s.bind(('127.0.0.1', 9999))
+print('Bind UDP on 9999...')
+print('Waiting for scenrio runner')
 
 pm = messaging.PubMaster(['roadCameraState', 'wideRoadCameraState', 'accelerometer', 'gyroscope', 'can', "gpsLocationExternal"])
 sm = messaging.SubMaster(['carControl', 'controlsState'])
@@ -38,7 +44,9 @@ def parse_args(add_args=None):
   parser.add_argument('--high_quality', action='store_true')
   parser.add_argument('--dual_camera', action='store_true')
   parser.add_argument('--town', type=str, default='Town04_Opt')
-  parser.add_argument('--spawn_point', dest='num_selected_spawn_point', type=int, default=16)
+  parser.add_argument('--spawn_point')
+  parser.add_argument('--v_x',default=0)
+  parser.add_argument('--v_y',default=0)
   parser.add_argument('--host', dest='host', type=str, default='127.0.0.1')
   parser.add_argument('--port', dest='port', type=int, default=2000)
 
@@ -294,40 +302,60 @@ class CarlaBridge:
     finally:
       # Clean up resources in the opposite order they were created.
       self.close()
-
+      time.sleep(0.5)
+  
   def _run(self, q: Queue):
     client = connect_carla_client(self._args.host, self._args.port)
-    world = client.load_world(self._args.town)
-
-    settings = world.get_settings()
+    self.world = client.load_world(self._args.town)
+    settings = self.world.get_settings()
     settings.synchronous_mode = True  # Enables synchronous mode
     settings.fixed_delta_seconds = 0.05
-    world.apply_settings(settings)
+    self.world.apply_settings(settings)
+    self.world.set_weather(carla.WeatherParameters.ClearSunset)
+    self.spectator = self.world.get_spectator()
+    self.spectator.set_transform(carla.Transform(carla.Location(
+        x=10, y=0, z=100), carla.Rotation(pitch=-90, roll=90)))
+    # if not self._args.high_quality:
+    #   self.world.unload_map_layer(carla.MapLayer.Foliage)
+    #   self.world.unload_map_layer(carla.MapLayer.Buildings)
+    #   self.world.unload_map_layer(carla.MapLayer.ParkedVehicles)
+    #   self.world.unload_map_layer(carla.MapLayer.Props)
+    #   self.world.unload_map_layer(carla.MapLayer.StreetLights)
+    #   self.world.unload_map_layer(carla.MapLayer.Particles)
 
-    world.set_weather(carla.WeatherParameters.ClearSunset)
+    blueprint_library = self.world.get_blueprint_library()
 
-    if not self._args.high_quality:
-      world.unload_map_layer(carla.MapLayer.Foliage)
-      world.unload_map_layer(carla.MapLayer.Buildings)
-      world.unload_map_layer(carla.MapLayer.ParkedVehicles)
-      world.unload_map_layer(carla.MapLayer.Props)
-      world.unload_map_layer(carla.MapLayer.StreetLights)
-      world.unload_map_layer(carla.MapLayer.Particles)
-
-    blueprint_library = world.get_blueprint_library()
-
-    world_map = world.get_map()
+    world_map = self.world.get_map()
 
     vehicle_bp = blueprint_library.filter('vehicle.tesla.*')[1]
-    vehicle_bp.set_attribute('role_name', 'hero')
-    spawn_points = world_map.get_spawn_points()
-    assert len(spawn_points) > self._args.num_selected_spawn_point, f'''No spawn point {self._args.num_selected_spawn_point}, try a value between 0 and
-      {len(spawn_points)} for this town.'''
-    spawn_point = spawn_points[self._args.num_selected_spawn_point]
-    vehicle = world.spawn_actor(vehicle_bp, spawn_point)
+    vehicle_bp.set_attribute('role_name', 'Ego')
+    # spawn_points = world_map.get_spawn_points()
+    # vehicle = self.world.spawn_actor(vehicle_bp, spawn_points[20])
+    spawn_point = self._args.spawn_point
+    vehicle = self.world.spawn_actor(vehicle_bp,spawn_point)
     self._carla_objects.append(vehicle)
     max_steer_angle = vehicle.get_physics_control().wheels[0].max_steer_angle
-
+    #*spawn some challenge vehicle
+    # sp = spawn_points[self._args.num_selected_spawn_point + 99]
+    # sp2 = carla.Transform(carla.Location(sp.location.x+4,sp.location.y+20,sp.location.z),sp.rotation)
+    # adv = self.world.try_spawn_actor(vehicle_bp, sp2)
+    # adv.set_target_velocity(carla.Vector3D(0,3,0))
+    # self._carla_objects.append(adv)
+    #*spawn some static cone
+    # cone_bp = blueprint_library.find('static.prop.trafficcone01')
+    # cone = world.spawn_actor(cone_bp,sp2)
+    # self._carla_objects.append(cone)
+    #*spawn_pedestrian
+    # ped_bp = blueprint_library.find('walker.pedestrian.0001')
+    # ped = world.spawn_actor(ped_bp,sp2)
+    # self._carla_objects.append(ped)
+    #*spawn_two_wheel_bicycle
+    # bic_bp = blueprint_library.find('vehicle.bh.crossbike')
+    # bic = world.spawn_actor(bic_bp,sp2)
+    # self._carla_objects.append(bic)
+    #*move spectator
+    # spectator = self.world.get_spectator()
+    # spectator.set_transform(carla.Transform(carla.Location(sp.location.x,sp.location.y,80),carla.Rotation(pitch=-90,roll = 90)))
     # make tires less slippery
     # wheel_control = carla.WheelPhysicsControl(tire_friction=5)
     physics_control = vehicle.get_physics_control()
@@ -336,7 +364,7 @@ class CarlaBridge:
     physics_control.torque_curve = [[20.0, 500.0], [5000.0, 500.0]]
     physics_control.gear_switch_time = 0.0
     vehicle.apply_physics_control(physics_control)
-
+    # vehicle.set_autopilot()
     transform = carla.Transform(carla.Location(x=0.8, z=1.13))
 
     def create_camera(fov, callback):
@@ -346,12 +374,11 @@ class CarlaBridge:
       blueprint.set_attribute('fov', str(fov))
       if not self._args.high_quality:
         blueprint.set_attribute('enable_postprocess_effects', 'False')
-      camera = world.spawn_actor(blueprint, transform, attach_to=vehicle)
+      camera = self.world.spawn_actor(blueprint, transform, attach_to=vehicle)
       camera.listen(callback)
       return camera
 
     self._camerad = Camerad(self._args.dual_camera)
-
     if self._args.dual_camera:
       road_wide_camera = create_camera(fov=120, callback=self._camerad.cam_callback_wide_road)  # fov bigger than 120 shows unwanted artifacts
       self._carla_objects.append(road_wide_camera)
@@ -359,15 +386,18 @@ class CarlaBridge:
     self._carla_objects.append(road_camera)
 
     vehicle_state = VehicleState()
+    vehicle_state.speed = math.sqrt(math.pow(self._args.v_x,2)+math.pow(self._args.v_y,2))
+    vehicle_state.cruise_button = 3
+    vehicle_state.is_engaged = True
 
     # re-enable IMU
     imu_bp = blueprint_library.find('sensor.other.imu')
     imu_bp.set_attribute('sensor_tick', '0.01')
-    imu = world.spawn_actor(imu_bp, transform, attach_to=vehicle)
+    imu = self.world.spawn_actor(imu_bp, transform, attach_to=vehicle)
     imu.listen(lambda imu: imu_callback(imu, vehicle_state))
 
     gps_bp = blueprint_library.find('sensor.other.gnss')
-    gps = world.spawn_actor(gps_bp, transform, attach_to=vehicle)
+    gps = self.world.spawn_actor(gps_bp, transform, attach_to=vehicle)
     gps.listen(lambda gps: gps_callback(gps, vehicle_state))
     self.params.put_bool("UbloxAvailable", True)
 
@@ -381,39 +411,38 @@ class CarlaBridge:
       t.start()
 
     # init
-    throttle_ease_out_counter = REPEAT_COUNTER
-    brake_ease_out_counter = REPEAT_COUNTER
-    steer_ease_out_counter = REPEAT_COUNTER
-
+    # throttle_ease_out_counter = REPEAT_COUNTER
+    # brake_ease_out_counter = REPEAT_COUNTER
+    # steer_ease_out_counter = REPEAT_COUNTER
     vc = carla.VehicleControl(throttle=0, steer=0, brake=0, reverse=False)
 
-    is_openpilot_engaged = False
-    throttle_out = steer_out = brake_out = 0.
-    throttle_op = steer_op = brake_op = 0.
-    throttle_manual = steer_manual = brake_manual = 0.
-
-    old_steer = old_brake = old_throttle = 0.
-    throttle_manual_multiplier = 0.7  # keyboard signal is always 1
-    brake_manual_multiplier = 0.7  # keyboard signal is always 1
-    steer_manual_multiplier = 45 * STEER_RATIO  # keyboard signal is always 1
-
+    is_openpilot_engaged = True
+    # throttle_out = steer_out = brake_out = 0.
+    # throttle_op = steer_op = brake_op = 0.
+    # throttle_manual = steer_manual = brake_manual = 0.
+    old_steer = 0
+    # old_steer = old_brake = old_throttle = 0.
+    # throttle_manual_multiplier = 0.7  # keyboard signal is always 1
+    # brake_manual_multiplier = 0.7  # keyboard signal is always 1
+    # steer_manual_multiplier = 45 * STEER_RATIO  # keyboard signal is always 1
     # Simulation tends to be slow in the initial steps. This prevents lagging later
-    for _ in range(20):
-      world.tick()
+    #! 确认此处的等待时间
+    for _ in range(300):
+      self.world.tick()
 
     # loop
     rk = Ratekeeper(100, print_delay_threshold=0.05)
-
+    # #*添加主车的初始速度
+    vehicle.set_target_velocity(carla.Vector3D(self._args.v_x,self._args.v_y,0))
+    self.world.tick()
     while self._keep_alive:
       # 1. Read the throttle, steer and brake from op or manual controls
       # 2. Set instructions in Carla
       # 3. Send current carstate to op via can
-
-      cruise_button = 0
-      throttle_out = steer_out = brake_out = 0.0
-      throttle_op = steer_op = brake_op = 0.0
-      throttle_manual = steer_manual = brake_manual = 0.0
-
+      # cruise_button = 0
+      # throttle_out = steer_out = brake_out = 0.0
+      # throttle_op = steer_op = brake_op = 0.0
+      # throttle_manual = steer_manual = brake_manual = 0.0
       # --------------Step 1-------------------------------
       if not q.empty():
         message = q.get()
@@ -444,18 +473,15 @@ class CarlaBridge:
           vehicle_state.ignition = not vehicle_state.ignition
         elif m[0] == "quit":
           break
+        # throttle_out = throttle_manual * throttle_manual_multiplier
+        # steer_out = steer_manual * steer_manual_multiplier
+        # brake_out = brake_manual * brake_manual_multiplier
 
-        throttle_out = throttle_manual * throttle_manual_multiplier
-        steer_out = steer_manual * steer_manual_multiplier
-        brake_out = brake_manual * brake_manual_multiplier
-
-        old_steer = steer_out
-        old_throttle = throttle_out
-        old_brake = brake_out
-
+        # old_steer = steer_out
+        # old_throttle = throttle_out
+        # old_brake = brake_out
       if is_openpilot_engaged:
         sm.update(0)
-
         # TODO gas and brake is deprecated
         throttle_op = clip(sm['carControl'].actuators.accel / 1.6, 0.0, 1.0)
         brake_op = clip(-sm['carControl'].actuators.accel / 4.0, 0.0, 1.0)
@@ -468,30 +494,30 @@ class CarlaBridge:
         steer_out = steer_rate_limit(old_steer, steer_out)
         old_steer = steer_out
 
-      else:
-        if throttle_out == 0 and old_throttle > 0:
-          if throttle_ease_out_counter > 0:
-            throttle_out = old_throttle
-            throttle_ease_out_counter += -1
-          else:
-            throttle_ease_out_counter = REPEAT_COUNTER
-            old_throttle = 0
+      # else:
+      #   if throttle_out == 0 and old_throttle > 0:
+      #     if throttle_ease_out_counter > 0:
+      #       throttle_out = old_throttle
+      #       throttle_ease_out_counter += -1
+      #     else:
+      #       throttle_ease_out_counter = REPEAT_COUNTER
+      #       old_throttle = 0
 
-        if brake_out == 0 and old_brake > 0:
-          if brake_ease_out_counter > 0:
-            brake_out = old_brake
-            brake_ease_out_counter += -1
-          else:
-            brake_ease_out_counter = REPEAT_COUNTER
-            old_brake = 0
+      #   if brake_out == 0 and old_brake > 0:
+      #     if brake_ease_out_counter > 0:
+      #       brake_out = old_brake
+      #       brake_ease_out_counter += -1
+      #     else:
+      #       brake_ease_out_counter = REPEAT_COUNTER
+      #       old_brake = 0
 
-        if steer_out == 0 and old_steer != 0:
-          if steer_ease_out_counter > 0:
-            steer_out = old_steer
-            steer_ease_out_counter += -1
-          else:
-            steer_ease_out_counter = REPEAT_COUNTER
-            old_steer = 0
+      #   if steer_out == 0 and old_steer != 0:
+      #     if steer_ease_out_counter > 0:
+      #       steer_out = old_steer
+      #       steer_ease_out_counter += -1
+      #     else:
+      #       steer_ease_out_counter = REPEAT_COUNTER
+      #       old_steer = 0
 
       # --------------Step 2-------------------------------
       steer_carla = steer_out / (max_steer_angle * STEER_RATIO * -1)
@@ -511,29 +537,36 @@ class CarlaBridge:
       vehicle_state.speed = speed
       vehicle_state.vel = vel
       vehicle_state.angle = steer_out
-      vehicle_state.cruise_button = cruise_button
+      vehicle_state.cruise_button = 0
       vehicle_state.is_engaged = is_openpilot_engaged
-
       if rk.frame % PRINT_DECIMATION == 0:
         print("frame: ", "engaged:", is_openpilot_engaged, "; throttle: ", round(vc.throttle, 3), "; steer(c/deg): ",
               round(vc.steer, 3), round(steer_out, 3), "; brake: ", round(vc.brake, 3))
 
       if rk.frame % 5 == 0:
-        world.tick()
+        self.world.tick()
       rk.keep_time()
       self.started = True
 
+
   def close(self):
+    print('close bridge')
     self.started = False
     self._exit_event.set()
-
-    for s in self._carla_objects:
-      try:
-        s.destroy()
-      except Exception as e:
-        print("Failed to destroy carla object", e)
+    try:
+      if hasattr(carla_bridge,'world'):
+        for s in self._carla_objects:
+          s.destroy()
+        new_settings = self.world.get_settings()
+        new_settings.fixed_delta_seconds = None
+        new_settings.synchronous_mode = False
+        self.world.apply_settings(new_settings)
+        time.sleep(0.5)
+    except Exception as e:
+      print("Failed to destroy carla object", e)
     for t in reversed(self._threads):
       t.join()
+
 
   def run(self, queue, retries=-1):
     bridge_p = Process(target=self.bridge_keep_alive, args=(queue, retries), daemon=True)
@@ -542,20 +575,29 @@ class CarlaBridge:
 
 
 if __name__ == "__main__":
+  data, addr = s.recvfrom(1024)
+  init_con = json.loads(bytes.decode(data))
+  reply = 'Hello, %s!' % data.decode('utf-8')
+  s.sendto(reply.encode('utf-8'), addr)
+  print('received inital condition from test manager')
   q: Any = Queue()
   args = parse_args()
-
+  args.town = init_con['map']
+  args.spawn_point = carla.Transform(carla.Location(x=init_con['x'],y=init_con['y'],z=init_con['z']),carla.Rotation(pitch=init_con['pitch'],roll=init_con['roll'],yaw=init_con['yaw']))
+  args.v_x = init_con['v_x']
+  args.v_y = init_con['v_y']
   carla_bridge = CarlaBridge(args)
   p = carla_bridge.run(q)
 
   if args.joystick:
     # start input poll for joystick
-    from openpilot.tools.sim.lib.manual_ctrl import wheel_poll_thread
+    from tools.sim.lib.manual_ctrl import wheel_poll_thread
 
     wheel_poll_thread(q)
   else:
     # start input poll for keyboard
-    from openpilot.tools.sim.lib.keyboard_ctrl import keyboard_poll_thread
+    from tools.sim.lib.keyboard_ctrl import keyboard_poll_thread
 
     keyboard_poll_thread(q)
   p.join()
+  s.close()
